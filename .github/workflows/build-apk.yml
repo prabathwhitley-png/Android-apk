@@ -1,0 +1,115 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake \
+            libffi-dev libssl-dev build-essential ccache
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install buildozer==1.5.0 cython==0.29.36
+
+      - name: Cache Buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+
+      - name: Build APK
+        run: buildozer -v android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: willy-sniper-apk
+          path: bin/*.apk
+          if-no-files-found: error
+
+      - name: Publish versioned GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const spec = fs.readFileSync('buildozer.spec', 'utf8');
+            const match = spec.match(/^version\s*=\s*([0-9A-Za-z._-]+)\s*$/m);
+            if (!match) throw new Error('Missing or invalid version in buildozer.spec');
+            const version = match[1];
+            const build = `${context.runNumber}.${process.env.GITHUB_RUN_ATTEMPT}`;
+            const tag = `v${version}-build.${build}`;
+            const files = fs.readdirSync('bin').filter(file => file.endsWith('.apk')).sort();
+            if (!files.length) throw new Error('No successfully built APK found');
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const notes = [
+              `## Willy Sniper ${version} — build ${build}`,
+              '',
+              `- App version: ${version}`,
+              `- Build: ${build}`,
+              `- Source commit: ${context.sha}`,
+              `- Workflow: ${runUrl}`,
+              '',
+              '### Download',
+              'Download the APK assets below. These are debug builds, not production-signed releases.',
+              'The trading app has not been verified against Binance; test safely before live use.',
+              '',
+            ].join('\n');
+            // Keep incomplete uploads hidden; publish only after every APK is attached.
+            const { data: release } = await github.rest.repos.createRelease({
+              owner, repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: `Willy Sniper ${version} — build ${build}`,
+              body: notes,
+              generate_release_notes: true,
+              draft: true,
+              prerelease: true,
+            });
+            for (const file of files) {
+              const data = fs.readFileSync(path.join('bin', file));
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo,
+                release_id: release.id,
+                name: file,
+                data,
+                headers: { 'content-type': 'application/vnd.android.package-archive' },
+              });
+            }
+            const { data: published } = await github.rest.repos.updateRelease({
+              owner, repo,
+              release_id: release.id,
+              draft: false,
+              make_latest: 'false',
+            });
+            await core.summary
+              .addHeading(`Willy Sniper ${version} — build ${build}`)
+              .addLink('Download APKs from this release', published.html_url)
+              .write();
